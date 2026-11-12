@@ -5,45 +5,66 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // Health check
     if (url.pathname === "/health") {
       return Response.json({
         status: "ok",
         service: "claude-freedom-bridge",
-        version: "0.3.0"
+        version: "0.4.0"
       });
     }
 
     const id = env.BRIDGE.idFromName("main");
     const stub = env.BRIDGE.get(id);
 
+    // Durable Object status
     if (url.pathname === "/do-status") {
       return stub.fetch("https://bridge.internal/status");
     }
 
+    // Authenticated WebSocket connection
     if (url.pathname === "/connect") {
       if (request.method !== "GET") {
-        return new Response("Method not allowed", { status: 405 });
+        return new Response("Method not allowed", {
+          status: 405
+        });
       }
 
-      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-        return new Response("WebSocket required", { status: 426 });
+      if (
+        request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
+      ) {
+        return new Response("WebSocket required", {
+          status: 426
+        });
       }
 
       if (!env.BRIDGE_TOKEN) {
-        return new Response("Server configuration error", { status: 503 });
+        return new Response("Server configuration error", {
+          status: 503
+        });
       }
 
-      const authorization = request.headers.get("Authorization") || "";
+      const authorization =
+        request.headers.get("Authorization") || "";
+
       const expected = `Bearer ${env.BRIDGE_TOKEN}`;
 
       const encoder = new TextEncoder();
+
       const [actualHash, expectedHash] = await Promise.all([
-        crypto.subtle.digest("SHA-256", encoder.encode(authorization)),
-        crypto.subtle.digest("SHA-256", encoder.encode(expected))
+        crypto.subtle.digest(
+          "SHA-256",
+          encoder.encode(authorization)
+        ),
+        crypto.subtle.digest(
+          "SHA-256",
+          encoder.encode(expected)
+        )
       ]);
 
       const a = new Uint8Array(actualHash);
       const b = new Uint8Array(expectedHash);
+
       let difference = 0;
 
       for (let i = 0; i < a.length; i++) {
@@ -51,7 +72,9 @@ export default {
       }
 
       if (difference !== 0) {
-        return new Response("Unauthorized", { status: 401 });
+        return new Response("Unauthorized", {
+          status: 401
+        });
       }
 
       return stub.fetch(request);
@@ -68,29 +91,44 @@ export class Bridge extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
 
+    // Status endpoint
     if (url.pathname === "/status") {
       return Response.json({
         status: "ready",
         durable_object: "Bridge",
-        connections: this.ctx.getWebSockets("agent").length,
-        version: "0.2.0"
+        connections: this.ctx.getWebSockets("agent").filter(
+          ws => ws.readyState === WebSocket.OPEN
+        ).length,
+        version: "0.3.0"
       });
     }
 
+    // WebSocket endpoint
     if (url.pathname === "/connect") {
-      if (request.method !== "GET" ||
-          request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-        return new Response("WebSocket required", { status: 426 });
+      if (
+        request.method !== "GET" ||
+        request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
+      ) {
+        return new Response("WebSocket required", {
+          status: 426
+        });
       }
 
-      const existing = this.ctx.getWebSockets("agent")
-        .filter(ws => ws.readyState === WebSocket.OPEN);
+      // Close previous connections before accepting the new one.
+      const existing = this.ctx.getWebSockets("agent").filter(
+        ws => ws.readyState === WebSocket.OPEN
+      );
 
-      if (existing.length > 0) {
-        return new Response("Agent already connected", { status: 409 });
+      for (const oldSocket of existing) {
+        try {
+          oldSocket.close(4001, "Replaced by reconnect");
+        } catch {
+          // Ignore stale socket errors.
+        }
       }
 
       const pair = new WebSocketPair();
+
       const [client, server] = Object.values(pair);
 
       this.ctx.acceptWebSocket(server, ["agent"]);
@@ -111,11 +149,16 @@ export class Bridge extends DurableObject {
       });
     }
 
-    return new Response("Not found", { status: 404 });
+    return new Response("Not found", {
+      status: 404
+    });
   }
 
   async webSocketMessage(ws, message) {
-    if (typeof message !== "string" || message.length > 8192) {
+    if (
+      typeof message !== "string" ||
+      message.length > 8192
+    ) {
       ws.send(JSON.stringify({
         type: "error",
         error: "invalid_message"
@@ -135,9 +178,12 @@ export class Bridge extends DurableObject {
       return;
     }
 
-    if (data.type === "ping" &&
-        typeof data.id === "string" &&
-        data.id.length <= 64) {
+    // Heartbeat response
+    if (
+      data.type === "ping" &&
+      typeof data.id === "string" &&
+      data.id.length <= 64
+    ) {
       ws.send(JSON.stringify({
         type: "pong",
         id: data.id
@@ -152,7 +198,7 @@ export class Bridge extends DurableObject {
   }
 
   async webSocketClose(ws, code, reason) {
-    ws.close(code, reason);
+    // Cloudflare handles the closed socket.
   }
 
   async webSocketError(ws, error) {
