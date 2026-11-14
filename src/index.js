@@ -2,7 +2,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 
-const VERSION = "0.6.0";
+const VERSION = "0.6.1";
 const MCP_PROTOCOL = "2025-03-26";
 const MAX_BODY = 4096;
 const REQUEST_TIMEOUT = 5000;
@@ -354,6 +354,171 @@ ${scopes}
 </html>`;
 }
 
+// ---------- AUTHORIZE ENDPOINT ----------
+//
+// /authorize serves THREE different requests. They must be told apart by
+// what the request contains, never by whether a session cookie happens to be
+// present:
+//
+//   GET                      -> login page (no session) or consent page
+//   POST with "password"     -> the LOGIN form
+//   POST with "handle"       -> the CONSENT form
+//
+// (v0.6.0 decided by session state alone. A login form submitted while a
+// valid session cookie existed was therefore treated as a consent form, and
+// failed with "Missing authorization handle.")
+
+function showLoginPage(request, status = 200) {
+  let csrf = getCookie(request, CSRF_COOKIE);
+
+  if (!csrf || !/^[a-f0-9]{32}$/.test(csrf)) {
+    csrf = crypto.randomUUID().replace(/-/g, "");
+  }
+
+  const url = new URL(request.url);
+  const next = url.pathname + url.search;
+
+  const headers = new Headers();
+
+  setCookie(headers, CSRF_COOKIE, csrf, {
+    maxAge: 600
+  });
+
+  return htmlResponse(loginPage(csrf, next), headers, status);
+}
+
+async function handleLoginPost(request, form, sessionSecret, loginPassword) {
+  const csrfForm = String(form.get("csrf") || "");
+  const csrfCookie = getCookie(request, CSRF_COOKIE);
+
+  if (
+    !csrfCookie ||
+    !/^[a-f0-9]{32}$/.test(csrfCookie) ||
+    !(await constantTimeEqual(csrfForm, csrfCookie))
+  ) {
+    return new Response("Invalid login form. Reload and try again.", {
+      status: 403
+    });
+  }
+
+  const suppliedPassword = String(form.get("password") || "");
+
+  if (
+    !(await constantTimeEqual(suppliedPassword, loginPassword))
+  ) {
+    return htmlResponse(
+      loginPage(
+        csrfCookie,
+        safeNext(String(form.get("next") || ""), request),
+        true
+      ),
+      new Headers(),
+      401
+    );
+  }
+
+  const session = await createSession(sessionSecret);
+  const headers = new Headers();
+
+  setCookie(headers, SESSION_COOKIE, session, {
+    httpOnly: true,
+    maxAge: SESSION_SECONDS
+  });
+
+  clearCookie(headers, CSRF_COOKIE);
+
+  headers.set(
+    "Location",
+    safeNext(String(form.get("next") || ""), request)
+  );
+
+  return new Response(null, {
+    status: 303,
+    headers
+  });
+}
+
+function authorizationFailure(error) {
+  if (error?.redirectTo) {
+    return Response.redirect(error.redirectTo, 302);
+  }
+
+  console.error("CFB authorization error:", error);
+
+  return new Response(
+    "Authorization failed. Please restart the sign-in process.",
+    { status: 400 }
+  );
+}
+
+async function showConsentPage(request, oauth) {
+  try {
+    const authRequest = await oauth.parseAuthRequest(request);
+    const details = await oauth.describeConsent(authRequest);
+    const consent = await oauth.beginConsent(authRequest);
+
+    consent.headers.set(
+      "Content-Type",
+      "text/html; charset=utf-8"
+    );
+
+    return htmlResponse(
+      consentPage(details, consent.handle),
+      consent.headers
+    );
+  } catch (error) {
+    return authorizationFailure(error);
+  }
+}
+
+async function handleConsentPost(request, form, oauth) {
+  const handle = String(form.get("handle") || "");
+
+  if (!handle) {
+    return new Response("Missing authorization handle.", {
+      status: 400
+    });
+  }
+
+  try {
+    if (form.get("decision") !== "approve") {
+      const denied = await oauth.denyConsent(request, handle);
+
+      return new Response(null, {
+        status: 302,
+        headers: denied.headers
+      });
+    }
+
+    const approved = await oauth.approveConsent(
+      request,
+      handle,
+      {
+        scope: form.getAll("scope").map(String)
+      }
+    );
+
+    const { redirectTo } = await oauth.completeAuthorization({
+      request: approved.request,
+      userId: "cfb-owner",
+      metadata: {},
+      scope: approved.request.scope,
+      props: {
+        userId: "cfb-owner"
+      }
+    });
+
+    approved.headers.set("Location", redirectTo);
+
+    return new Response(null, {
+      status: 302,
+      headers: approved.headers
+    });
+  } catch (error) {
+    return authorizationFailure(error);
+  }
+}
+
 async function handleAuthorize(request, env) {
   const oauth = env.OAUTH_PROVIDER;
   const sessionSecret = env.CFB_SESSION_SECRET;
@@ -367,169 +532,54 @@ async function handleAuthorize(request, env) {
 
   const signedIn = await verifySession(request, sessionSecret);
 
-  // Login form and password submission
-  if (!signedIn) {
-    if (request.method === "GET") {
-      let csrf = getCookie(request, CSRF_COOKIE);
-
-      if (!csrf || !/^[a-f0-9]{32}$/.test(csrf)) {
-        csrf = crypto.randomUUID().replace(/-/g, "");
-      }
-
-      const next = new URL(request.url).pathname +
-        new URL(request.url).search;
-
-      const headers = new Headers();
-
-      setCookie(headers, CSRF_COOKIE, csrf, {
-        maxAge: 600
-      });
-
-      return htmlResponse(loginPage(csrf, next), headers);
+  if (request.method === "GET") {
+    if (!signedIn) {
+      return showLoginPage(request);
     }
 
-    if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
-    }
-
-    const contentLength = Number(
-      request.headers.get("Content-Length") || "0"
-    );
-
-    if (contentLength > MAX_BODY) {
-      return new Response("Request too large", { status: 413 });
-    }
-
-    const form = await request.formData();
-
-    const csrfForm = String(form.get("csrf") || "");
-    const csrfCookie = getCookie(request, CSRF_COOKIE);
-
-    if (
-      !csrfCookie ||
-      !/^[a-f0-9]{32}$/.test(csrfCookie) ||
-      !(await constantTimeEqual(csrfForm, csrfCookie))
-    ) {
-      return new Response("Invalid login form. Reload and try again.", {
-        status: 403
-      });
-    }
-
-    const suppliedPassword = String(form.get("password") || "");
-
-    if (
-      !(await constantTimeEqual(suppliedPassword, loginPassword))
-    ) {
-      return htmlResponse(
-        loginPage(
-          csrfCookie,
-          safeNext(String(form.get("next") || ""), request),
-          true
-        ),
-        new Headers(),
-        401
-      );
-    }
-
-    const session = await createSession(sessionSecret);
-    const headers = new Headers();
-
-    setCookie(headers, SESSION_COOKIE, session, {
-      httpOnly: true,
-      maxAge: SESSION_SECONDS
-    });
-
-    clearCookie(headers, CSRF_COOKIE);
-
-    headers.set(
-      "Location",
-      safeNext(String(form.get("next") || ""), request)
-    );
-
-    return new Response(null, {
-      status: 303,
-      headers
-    });
+    return showConsentPage(request, oauth);
   }
 
-  // OAuth consent flow
-  try {
-    if (request.method === "GET") {
-      const authRequest = await oauth.parseAuthRequest(request);
-      const details = await oauth.describeConsent(authRequest);
-      const consent = await oauth.beginConsent(authRequest);
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405 });
+  }
 
-      consent.headers.set(
-        "Content-Type",
-        "text/html; charset=utf-8"
-      );
+  const contentLength = Number(
+    request.headers.get("Content-Length") || "0"
+  );
 
-      return htmlResponse(
-        consentPage(details, consent.handle),
-        consent.headers
-      );
-    }
+  if (contentLength > MAX_BODY) {
+    return new Response("Request too large", { status: 413 });
+  }
 
-    if (request.method === "POST") {
-      const form = await request.formData();
-      const handle = String(form.get("handle") || "");
+  const form = await request.formData();
 
-      if (!handle) {
-        return new Response("Missing authorization handle.", {
-          status: 400
-        });
-      }
-
-      if (form.get("decision") !== "approve") {
-        const denied = await oauth.denyConsent(request, handle);
-
-        return new Response(null, {
-          status: 302,
-          headers: denied.headers
-        });
-      }
-
-      const approved = await oauth.approveConsent(
-        request,
-        handle,
-        {
-          scope: form.getAll("scope").map(String)
-        }
-      );
-
-      const { redirectTo } = await oauth.completeAuthorization({
-        request: approved.request,
-        userId: "cfb-owner",
-        metadata: {},
-        scope: approved.request.scope,
-        props: {
-          userId: "cfb-owner"
-        }
-      });
-
-      approved.headers.set("Location", redirectTo);
-
-      return new Response(null, {
-        status: 302,
-        headers: approved.headers
-      });
-    }
-
-    return new Response("Method not allowed", {
-      status: 405
-    });
-  } catch (error) {
-    if (error?.redirectTo) {
-      return Response.redirect(error.redirectTo, 302);
-    }
-
-    console.error("CFB authorization error:", error);
-
-    return new Response(
-      "Authorization failed. Please restart the sign-in process.",
-      { status: 400 }
+  // LOGIN form: always handled as a login, whether or not a session
+  // cookie is already present. CSRF and password are re-checked.
+  if (form.has("password")) {
+    return handleLoginPost(
+      request,
+      form,
+      sessionSecret,
+      loginPassword
     );
   }
+
+  // CONSENT form: only valid for a signed-in browser.
+  if (form.has("handle")) {
+    if (!signedIn) {
+      // The login session expired between the consent page and the
+      // click. Show the login page again; after login the browser is
+      // sent back to /authorize and gets a fresh consent page.
+      return showLoginPage(request, 401);
+    }
+
+    return handleConsentPost(request, form, oauth);
+  }
+
+  return new Response("Invalid authorization form submission.", {
+    status: 400
+  });
 }
 
 // ---------- MCP TOOLS ----------
