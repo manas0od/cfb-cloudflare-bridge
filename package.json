@@ -1,0 +1,16 @@
+
+{
+  "name": "claude-freedom-bridge",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "1.2.4"
+  },
+  "devDependencies": {
+    "wrangler": "4.160.1"
+  }
+}
