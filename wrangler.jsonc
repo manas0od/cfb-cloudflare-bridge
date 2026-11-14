@@ -1,10 +1,19 @@
 
 {
-  "$schema": "./node_modules/wrangler/config-schema.json",
+  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "claude-freedom-bridge",
   "main": "src/index.js",
-  "compatibility_date": "2026-11-12",
+  "compatibility_date": "2026-11-14",
+  "compatibility_flags": [
+    "global_fetch_strictly_public"
+  ],
   "workers_dev": true,
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "ba9ede8e8a7e4decb4c02ea2b07fe992"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
