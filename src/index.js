@@ -1,7 +1,7 @@
-
 import { DurableObject } from "cloudflare:workers";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
+const MCP_PROTOCOL = "2025-03-26";
 const MAX_BODY = 4096;
 const REQUEST_TIMEOUT = 5000;
 
@@ -28,6 +28,215 @@ async function validToken(request, expectedToken) {
   return difference === 0;
 }
 
+function jsonRpc(id, result) {
+  return Response.json({
+    jsonrpc: "2.0",
+    id,
+    result
+  });
+}
+
+function jsonRpcError(id, code, message) {
+  return Response.json({
+    jsonrpc: "2.0",
+    id: id ?? null,
+    error: { code, message }
+  });
+}
+
+async function handleMcp(request, env, stub) {
+  if (request.method !== "POST") {
+    return new Response("POST required", { status: 405 });
+  }
+
+  const body = await request.text();
+
+  if (body.length > MAX_BODY) {
+    return new Response("Request too large", { status: 413 });
+  }
+
+  let data;
+
+  try {
+    data = JSON.parse(body);
+  } catch {
+    return jsonRpcError(null, -32700, "Parse error");
+  }
+
+  if (
+    !data ||
+    data.jsonrpc !== "2.0" ||
+    typeof data.method !== "string" ||
+    !Object.prototype.hasOwnProperty.call(data, "id") &&
+      !data.method.startsWith("notifications/")
+  ) {
+    return jsonRpcError(data?.id ?? null, -32600, "Invalid request");
+  }
+
+  const id = data.id ?? null;
+  const params = data.params || {};
+
+  if (data.method === "notifications/initialized") {
+    return new Response(null, { status: 202 });
+  }
+
+  if (data.method === "notifications/cancelled") {
+    return new Response(null, { status: 202 });
+  }
+
+  if (data.method === "initialize") {
+    return jsonRpc(id, {
+      protocolVersion: MCP_PROTOCOL,
+      capabilities: {
+        tools: {
+          listChanged: false
+        }
+      },
+      serverInfo: {
+        name: "claude-freedom-bridge",
+        version: VERSION
+      },
+      instructions:
+        "CFB provides read-only status diagnostics and an echo test. It does not provide shell execution."
+    });
+  }
+
+  if (data.method === "ping") {
+    return jsonRpc(id, {});
+  }
+
+  if (data.method === "tools/list") {
+    return jsonRpc(id, {
+      tools: [
+        {
+          name: "status",
+          description: "Check whether the connected Termux agent is online and get device runtime information.",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false
+          }
+        },
+        {
+          name: "echo",
+          description: "Send a test message through the Termux agent and receive it back.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              message: {
+                type: "string",
+                description: "The message to echo back.",
+                maxLength: 1000
+              }
+            },
+            required: ["message"],
+            additionalProperties: false
+          }
+        }
+      ]
+    });
+  }
+
+  if (data.method === "tools/call") {
+    if (!params || typeof params.name !== "string") {
+      return jsonRpcError(id, -32602, "Invalid tool parameters");
+    }
+
+    const action = params.name;
+    const args = params.arguments || {};
+
+    if (!["status", "echo"].includes(action)) {
+      return jsonRpcError(id, -32602, "Unknown tool");
+    }
+
+    if (
+      !args ||
+      typeof args !== "object" ||
+      Array.isArray(args)
+    ) {
+      return jsonRpcError(id, -32602, "Invalid tool arguments");
+    }
+
+    if (
+      action === "echo" &&
+      (typeof args.message !== "string" ||
+       args.message.length > 1000)
+    ) {
+      return jsonRpcError(id, -32602, "Invalid echo message");
+    }
+
+    if (action === "status" && Object.keys(args).length !== 0) {
+      return jsonRpcError(id, -32602, "Status takes no arguments");
+    }
+
+    const requestId = crypto.randomUUID().replace(/-/g, "");
+
+    let upstream;
+
+    try {
+      upstream = await stub.fetch(
+        new Request("https://bridge.internal/request", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            type: "request",
+            request_id: requestId,
+            action,
+            payload: action === "echo"
+              ? { message: args.message }
+              : {}
+          })
+        })
+      );
+    } catch {
+      return jsonRpc(id, {
+        isError: true,
+        content: [{
+          type: "text",
+          text: "Could not contact the CFB Durable Object."
+        }]
+      });
+    }
+
+    let result;
+
+    try {
+      result = await upstream.json();
+    } catch {
+      return jsonRpc(id, {
+        isError: true,
+        content: [{
+          type: "text",
+          text: "Invalid response from CFB Durable Object."
+        }]
+      });
+    }
+
+    if (!upstream.ok || !result.result?.ok) {
+      return jsonRpc(id, {
+        isError: true,
+        content: [{
+          type: "text",
+          text: JSON.stringify(result)
+        }]
+      });
+    }
+
+    return jsonRpc(id, {
+      content: [{
+        type: "text",
+        text: JSON.stringify(result.result)
+      }],
+      structuredContent: result.result,
+      isError: false
+    });
+  }
+
+  return jsonRpcError(id, -32601, "Method not found");
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -47,10 +256,21 @@ export default {
       return stub.fetch("https://bridge.internal/status");
     }
 
-    if (url.pathname === "/connect" || url.pathname === "/request") {
+    if (
+      url.pathname === "/connect" ||
+      url.pathname === "/request"
+    ) {
       if (!(await validToken(request, env.BRIDGE_TOKEN))) {
         return new Response("Unauthorized", { status: 401 });
       }
+    }
+
+    if (url.pathname === "/mcp") {
+      if (!(await validToken(request, env.MCP_TOKEN))) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      return handleMcp(request, env, stub);
     }
 
     if (url.pathname === "/connect") {
@@ -167,6 +387,7 @@ export class Bridge extends DurableObject {
       const requestId = data.request_id;
 
       this.recentIds.add(requestId);
+
       if (this.recentIds.size > 256) {
         this.recentIds.delete(this.recentIds.values().next().value);
       }
