@@ -2,7 +2,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 
-const VERSION = "0.7.0";
+const VERSION = "0.7.1";
 const MCP_PROTOCOL = "2025-03-26";
 const MAX_BODY = 16384;
 const REQUEST_TIMEOUT = 15000;
@@ -265,14 +265,52 @@ ${error ? '<p class="error">Incorrect password or expired login form.</p>' : ""}
 </html>`;
 }
 
-function htmlResponse(html, headers = new Headers(), status = 200) {
+// CSP source for the OAuth client's redirect target, or null if it is not a
+// plain origin / scheme. Browsers (Chromium) apply `form-action` to the
+// redirect that FOLLOWS a form POST, so the consent form's own CSP must allow
+// the client's callback origin or the final 302 to the client is blocked.
+// The value is built only from a redirect URI that parseAuthRequest() already
+// matched against the client's registered URIs, and is re-validated here so
+// that nothing outside a strict origin grammar can reach the header.
+function redirectFormAction(redirectUri) {
+  try {
+    const url = new URL(redirectUri);
+
+    if (url.protocol === "https:" || url.protocol === "http:") {
+      return /^https?:\/\/(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*|\[[0-9A-Fa-f:]+\])(?::\d{1,5})?$/.test(url.origin)
+        ? url.origin
+        : null;
+    }
+
+    // Custom application scheme (for example "app.example:/callback").
+    // Never allow schemes that can execute or read local content.
+    if (
+      /^(?:javascript|data|vbscript|blob|file|about|filesystem):$/i.test(url.protocol)
+    ) {
+      return null;
+    }
+
+    return /^[a-z][a-z0-9+.-]*:$/.test(url.protocol)
+      ? url.protocol
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function htmlResponse(
+  html,
+  headers = new Headers(),
+  status = 200,
+  formActionSource = null
+) {
   headers.set("Content-Type", "text/html; charset=utf-8");
   headers.set("Cache-Control", "no-store");
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("X-Frame-Options", "DENY");
   headers.set(
     "Content-Security-Policy",
-    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'${formActionSource ? " " + formActionSource : ""}; base-uri 'none'; frame-ancestors 'none'`
   );
 
   return new Response(html, { status, headers });
@@ -443,7 +481,14 @@ function authorizationFailure(error) {
     return Response.redirect(error.redirectTo, 302);
   }
 
-  console.error("CFB authorization error:", error);
+  console.error(
+    "CFB authorization error: " +
+      JSON.stringify({
+        name: error?.name,
+        code: error?.code,
+        message: String(error?.message ?? error).slice(0, 300)
+      })
+  );
 
   return new Response(
     "Authorization failed. Please restart the sign-in process.",
@@ -464,7 +509,9 @@ async function showConsentPage(request, oauth) {
 
     return htmlResponse(
       consentPage(details, consent.handle),
-      consent.headers
+      consent.headers,
+      200,
+      redirectFormAction(details.redirectUri)
     );
   } catch (error) {
     return authorizationFailure(error);
