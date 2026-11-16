@@ -1,0 +1,108 @@
+
+name: CFB OAuth Integration Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'Test/**'
+      - 'wrangler.jsonc'
+      - 'package.json'
+      - '.github/workflows/oauth-integration-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  oauth-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check src/index.js
+          node --check Test/redirect-form-action.test.mjs
+
+      - name: Test redirect CSP helper
+        run: node Test/redirect-form-action.test.mjs
+
+      - name: Check Python test syntax
+        run: python -m py_compile Test/oauth-flow.py
+
+      - name: Create test-only secrets
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from secrets import token_hex
+
+          Path(".dev.vars").write_text(
+              f"CFB_SESSION_SECRET={token_hex(32)}\n"
+              "CFB_LOGIN_PASSWORD=test-password\n"
+          )
+          PY
+
+      - name: Seed local OAuth client
+        run: |
+          CLIENT_JSON=$(python -c 'import json; print(json.dumps({
+            "clientId": "testclient",
+            "redirectUris": ["https://claude.ai/api/mcp/auth_callback"],
+            "clientName": "Test",
+            "registrationDate": 1700000000,
+            "tokenEndpointAuthMethod": "none",
+            "grantTypes": ["authorization_code", "refresh_token"],
+            "responseTypes": ["code"]
+          }))')
+
+          npx wrangler kv key put \
+            --binding OAUTH_KV \
+            --local \
+            --persist-to .wrangler/state \
+            'client:testclient' \
+            "$CLIENT_JSON"
+
+      - name: Run local Worker and OAuth integration tests
+        run: |
+          npx wrangler dev \
+            --local \
+            --persist-to .wrangler/state \
+            --port 8787 \
+            > /tmp/cfb-wrangler.log 2>&1 &
+
+          WRANGLER_PID=$!
+          trap 'kill "$WRANGLER_PID" 2>/dev/null || true' EXIT
+
+          READY=0
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8787/health >/dev/null; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            cat /tmp/cfb-wrangler.log
+            exit 1
+          fi
+
+          python Test/oauth-flow.py
